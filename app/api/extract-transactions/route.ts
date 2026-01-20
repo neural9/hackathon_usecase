@@ -1,0 +1,184 @@
+import { NextRequest, NextResponse } from "next/server";
+import { readFile } from "fs/promises";
+import path from "path";
+import Anthropic from "@anthropic-ai/sdk";
+import { getOrCreateUser } from "@/lib/user";
+import { prisma } from "@/lib/prisma";
+import { Prisma } from "@prisma/client";
+
+const anthropic = new Anthropic();
+
+interface ExtractedTransaction {
+  date: string;
+  description: string;
+  amount: number;
+  type: "CREDIT" | "DEBIT";
+  balance?: number;
+  category?: string;
+}
+
+interface ExtractionResponse {
+  transactions: ExtractedTransaction[];
+}
+
+export async function POST(request: NextRequest) {
+  const user = await getOrCreateUser();
+
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const { fileId } = await request.json();
+
+  if (!fileId) {
+    return NextResponse.json({ error: "File ID is required" }, { status: 400 });
+  }
+
+  // Get the file from the database
+  const file = await prisma.applicationFile.findUnique({
+    where: { id: fileId },
+    include: { application: true },
+  });
+
+  if (!file) {
+    return NextResponse.json({ error: "File not found" }, { status: 404 });
+  }
+
+  // Verify user owns this file or is a reviewer
+  if (file.application.userId !== user.id && user.role !== "REVIEWER") {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  // Read the file from disk
+  const uploadDir = path.join(process.cwd(), "uploads");
+  const filePath = path.join(uploadDir, file.filename);
+  const fileBuffer = await readFile(filePath);
+  const base64Data = fileBuffer.toString("base64");
+
+  // Determine if it's a PDF or image
+  const isPdf = file.mimeType === "application/pdf";
+  const isImage =
+    file.mimeType === "image/png" ||
+    file.mimeType === "image/jpeg" ||
+    file.mimeType === "image/jpg" ||
+    file.mimeType === "image/gif" ||
+    file.mimeType === "image/webp";
+
+  if (!isPdf && !isImage) {
+    return NextResponse.json(
+      { error: "Unsupported file type. Please upload a PDF or image." },
+      { status: 400 }
+    );
+  }
+
+  const promptText = `Analyze this bank statement or financial document and extract all transactions.
+
+Return a JSON object with a "transactions" array. Each transaction should have:
+- date: ISO 8601 date string (YYYY-MM-DD)
+- description: string describing the transaction
+- amount: positive number (the absolute value of the transaction)
+- type: "CREDIT" for money coming in, "DEBIT" for money going out
+- balance: the balance after this transaction (if available, otherwise omit)
+- category: a category for the transaction (e.g., "Groceries", "Utilities", "Salary", "Transfer", "Entertainment", "Gambling", etc.)
+
+Return ONLY valid JSON, no other text. If you cannot extract any transactions, return: {"transactions": []}
+
+Example response:
+{
+  "transactions": [
+    {"date": "2024-01-15", "description": "TESCO STORES", "amount": 45.67, "type": "DEBIT", "balance": 1234.56, "category": "Groceries"},
+    {"date": "2024-01-14", "description": "SALARY ACME INC", "amount": 2500.00, "type": "CREDIT", "balance": 1280.23, "category": "Salary"}
+  ]
+}`;
+
+  // Call Claude API to extract transactions
+  let message;
+  if (isPdf) {
+    message = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 16384,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: {
+                type: "base64",
+                media_type: "application/pdf",
+                data: base64Data,
+              },
+            },
+            { type: "text", text: promptText },
+          ],
+        },
+      ],
+    });
+  } else {
+    const imageMediaType =
+      file.mimeType === "image/png"
+        ? "image/png"
+        : file.mimeType === "image/gif"
+          ? "image/gif"
+          : file.mimeType === "image/webp"
+            ? "image/webp"
+            : "image/jpeg";
+    message = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 16384,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: imageMediaType,
+                data: base64Data,
+              },
+            },
+            { type: "text", text: promptText },
+          ],
+        },
+      ],
+    });
+  }
+
+  // Parse the response
+  const responseText =
+    message.content[0].type === "text" ? message.content[0].text : "";
+
+  let extractedData: ExtractionResponse;
+  try {
+    // Clean up response - remove markdown code blocks if present
+    let cleanedResponse = responseText.trim();
+    if (cleanedResponse.startsWith("```json")) {
+      cleanedResponse = cleanedResponse.slice(7);
+    } else if (cleanedResponse.startsWith("```")) {
+      cleanedResponse = cleanedResponse.slice(3);
+    }
+    if (cleanedResponse.endsWith("```")) {
+      cleanedResponse = cleanedResponse.slice(0, -3);
+    }
+    extractedData = JSON.parse(cleanedResponse.trim());
+  } catch {
+    console.error("Failed to parse Claude response:", responseText);
+    return NextResponse.json(
+      { error: "Failed to parse transaction data from document" },
+      { status: 500 }
+    );
+  }
+
+  // Store transactions JSON in the ApplicationFile record
+  await prisma.applicationFile.update({
+    where: { id: file.id },
+    data: { transactions: extractedData.transactions as unknown as Prisma.InputJsonValue },
+  });
+
+  return NextResponse.json({
+    success: true,
+    count: extractedData.transactions.length,
+    transactions: extractedData.transactions,
+  });
+}
